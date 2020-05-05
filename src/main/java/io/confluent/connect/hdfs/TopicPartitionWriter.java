@@ -70,8 +70,11 @@ public class TopicPartitionWriter {
   private final boolean hiveIntegration;
   private final Time time;
   private final HdfsStorage storage;
+  private final long fileSizeLimit = 1048576L;
   private final WAL wal;
   private final Map<String, String> tempFiles;
+  private final Map<String,Long> tempFileSizes;
+  private final Map<String,String> markedTempFiles;
   private final Map<String, io.confluent.connect.storage.format.RecordWriter> writers;
   private final TopicPartition tp;
   private final Partitioner partitioner;
@@ -203,6 +206,8 @@ public class TopicPartitionWriter {
     buffer = new LinkedList<>();
     writers = new HashMap<>();
     tempFiles = new HashMap<>();
+    markedTempFiles = new HashMap<>();
+    tempFileSizes = new HashMap<>();
     appended = new HashSet<>();
     startOffsets = new HashMap<>();
     offsets = new HashMap<>();
@@ -389,6 +394,7 @@ public class TopicPartitionWriter {
             }
           case SHOULD_ROTATE:
             updateRotationTimers(currentRecord);
+            markRotate();
             closeTempFile();
             nextState();
           case TEMP_FILE_CLOSED:
@@ -689,6 +695,14 @@ public class TopicPartitionWriter {
     io.confluent.connect.storage.format.RecordWriter writer = getWriter(record, encodedPartition);
     writer.write(record);
 
+    byte[] recordData = (byte[]) record.value();
+    if (tempFileSizes.containsKey(encodedPartition)) {
+      long newSize = tempFileSizes.get(encodedPartition) + Long.valueOf(recordData.length);
+      tempFileSizes.put(encodedPartition, newSize);
+    } else {
+      tempFileSizes.put(encodedPartition, Long.valueOf(recordData.length));
+    }
+
     if (!startOffsets.containsKey(encodedPartition)) {
       startOffsets.put(encodedPartition, record.kafkaOffset());
     }
@@ -711,6 +725,7 @@ public class TopicPartitionWriter {
     }
   }
 
+
   private void closeTempFile() {
     for (String encodedPartition : tempFiles.keySet()) {
       // Close the file and propagate any errors
@@ -718,8 +733,22 @@ public class TopicPartitionWriter {
     }
   }
 
+  private void markRotate() {
+    for (String encodedPartition : tempFiles.keySet()) {
+      long size = tempFileSizes.get(encodedPartition);
+      if (size > fileSizeLimit) {
+        log.trace("Size for encodedPartition " + tempFiles.get(encodedPartition) + " :: " + size);
+        markedTempFiles.put(encodedPartition, tempFiles.get(encodedPartition));
+      } else {
+        offset = offset + recordCounter; // offset of next record to be reading
+        recordCounter = 0;
+      }
+    }
+
+  }
+
   private void appendToWAL(String encodedPartition) {
-    String tempFile = tempFiles.get(encodedPartition);
+    String tempFile = markedTempFiles.get(encodedPartition);
     if (appended.contains(tempFile)) {
       return;
     }
@@ -745,7 +774,7 @@ public class TopicPartitionWriter {
 
   private void appendToWAL() {
     beginAppend();
-    for (String encodedPartition : tempFiles.keySet()) {
+    for (String encodedPartition : markedTempFiles.keySet()) {
       appendToWAL(encodedPartition);
     }
     endAppend();
@@ -766,7 +795,7 @@ public class TopicPartitionWriter {
   private void commitFile() {
     log.debug("Committing files");
     appended.clear();
-    for (String encodedPartition : tempFiles.keySet()) {
+    for (String encodedPartition : markedTempFiles.keySet()) {
       commitFile(encodedPartition);
     }
   }
@@ -778,7 +807,7 @@ public class TopicPartitionWriter {
     }
     long startOffset = startOffsets.get(encodedPartition);
     long endOffset = offsets.get(encodedPartition);
-    String tempFile = tempFiles.get(encodedPartition);
+    String tempFile = markedTempFiles.get(encodedPartition);
     String directory = getDirectory(encodedPartition);
     String committedFile = FileUtils.committedFileName(
         url,
